@@ -68,6 +68,8 @@ static std::string DataTypeToMLIRImpl(::pypto::DataType dtype) {
     return "bf16";
   } else if (dtype == ::pypto::DataType::INT32) {
     return "i32";
+  } else if (dtype == ::pypto::DataType::INDEX) {
+    return "index";
   } else if (dtype == ::pypto::DataType::INT64) {
     return "i64";
   } else if (dtype == ::pypto::DataType::INT8) {
@@ -214,6 +216,24 @@ void PTOCodegen::GenerateFunction(const FunctionPtr& func) {
   }
   memref_to_tile_type_ = collector.GetMemRefTileTypes();
 
+  // Collect ordered unique dynamic dimension variables from tensor parameter shapes
+  std::vector<std::string> dyn_var_names;
+  {
+    std::set<std::string> seen_dyn_vars;
+    for (const auto& param : func->params_) {
+      if (auto tensor_type = As<TensorType>(param->GetType())) {
+        for (const auto& dim : tensor_type->shape_) {
+          if (auto var = As<ir::Var>(dim)) {
+            if (seen_dyn_vars.find(var->name_) == seen_dyn_vars.end()) {
+              dyn_var_names.push_back(var->name_);
+              seen_dyn_vars.insert(var->name_);
+            }
+          }
+        }
+      }
+    }
+  }
+
   stream_ << "  func.func @" << func->name_ << "(";
 
   std::set<std::string> param_names;
@@ -235,6 +255,14 @@ void PTOCodegen::GenerateFunction(const FunctionPtr& func) {
     }
   }
 
+  // Append trailing index parameters for each unique dynamic dimension variable
+  size_t next_arg_idx = func->params_.size();
+  for (const auto& var_name : dyn_var_names) {
+    std::string arg_name = "%arg" + std::to_string(next_arg_idx++);
+    stream_ << ", " << arg_name << ": index";
+    var_to_mlir_[var_name] = arg_name;
+  }
+
   stream_ << ") {\n";
   indent_level_++;
 
@@ -250,12 +278,14 @@ void PTOCodegen::GenerateFunction(const FunctionPtr& func) {
       tensor_to_view_[var->name_] = tensor_view;
 
       for (const auto& j : tensor_type->shape_) {
-        int64_t dim = GetConstIntValue(j);
-        GetOrEmitIndexConstant(dim);
+        if (As<ir::ConstInt>(j)) {
+          GetOrEmitIndexConstant(GetConstIntValue(j));
+        }
       }
       if (tensor_type->shape_.size() == 2) {
-        int64_t dim1 = GetConstIntValue(tensor_type->shape_[1]);
-        GetOrEmitIndexConstant(dim1);
+        if (As<ir::ConstInt>(tensor_type->shape_[1])) {
+          GetOrEmitIndexConstant(GetConstIntValue(tensor_type->shape_[1]));
+        }
         GetOrEmitIndexConstant(1);
       } else if (tensor_type->shape_.size() == 1) {
         GetOrEmitIndexConstant(1);
@@ -319,15 +349,22 @@ void PTOCodegen::EmitMakeTensorViews(const FunctionPtr& func) {
       stream_ << ", shape = [";
       for (size_t j = 0; j < tensor_type->shape_.size(); j++) {
         if (j > 0) stream_ << ", ";
-        int64_t dim = GetConstIntValue(tensor_type->shape_[j]);
-        stream_ << GetOrEmitIndexConstant(dim);
+        if (auto var = As<ir::Var>(tensor_type->shape_[j])) {
+          stream_ << var_to_mlir_.at(var->name_);
+        } else {
+          stream_ << GetOrEmitIndexConstant(GetConstIntValue(tensor_type->shape_[j]));
+        }
       }
       stream_ << "]";
 
       stream_ << " strides = [";
       if (tensor_type->shape_.size() == 2) {
-        int64_t dim1 = GetConstIntValue(tensor_type->shape_[1]);
-        stream_ << GetOrEmitIndexConstant(dim1) << ", " << GetOrEmitIndexConstant(1);
+        if (auto var = As<ir::Var>(tensor_type->shape_[1])) {
+          stream_ << var_to_mlir_.at(var->name_);
+        } else {
+          stream_ << GetOrEmitIndexConstant(GetConstIntValue(tensor_type->shape_[1]));
+        }
+        stream_ << ", " << GetOrEmitIndexConstant(1);
       } else if (tensor_type->shape_.size() == 1) {
         stream_ << GetOrEmitIndexConstant(1);
       }
@@ -347,8 +384,34 @@ void PTOCodegen::EmitAllocTiles(const ir::FunctionPtr& func, const std::vector<i
   (void)func;
   for (const auto& memref : memrefs) {
     std::string tile_buf = memref_to_mlir_[memref.get()];
-    stream_ << GetIndent() << tile_buf << " = pto.alloc_tile : " << GetTileBufTypeString(memref.get())
-            << "\n";
+
+    // Collect dynamic valid_shape variable names if present
+    std::string valid_row_mlir;
+    std::string valid_col_mlir;
+    auto tile_it = memref_to_tile_type_.find(memref.get());
+    if (tile_it != memref_to_tile_type_.end()) {
+      const auto& tile_type = tile_it->second;
+      if (tile_type->tile_view_.has_value()) {
+        const auto& tv = tile_type->tile_view_.value();
+        if (tv.valid_shape.size() >= 1) {
+          if (auto var = As<ir::Var>(tv.valid_shape[0])) {
+            valid_row_mlir = GetVarName(var);
+          }
+        }
+        if (tv.valid_shape.size() >= 2) {
+          if (auto var = As<ir::Var>(tv.valid_shape[1])) {
+            valid_col_mlir = GetVarName(var);
+          }
+        }
+      }
+    }
+
+    std::ostringstream line;
+    line << tile_buf << " = pto.alloc_tile";
+    if (!valid_row_mlir.empty()) line << " valid_row = " << valid_row_mlir;
+    if (!valid_col_mlir.empty()) line << " valid_col = " << valid_col_mlir;
+    line << " : " << GetTileBufTypeString(memref.get());
+    stream_ << GetIndent() << line.str() << "\n";
   }
 }
 
@@ -395,7 +458,7 @@ void PTOCodegen::EmitExtraAllocTiles() {
 void PTOCodegen::VisitStmt_(const AssignStmtPtr& op) {
   if (auto call = As<ir::Call>(op->value_)) {
     if (backend_ != nullptr && backend_->GetOpInfo(call->op_->name_) != nullptr) {
-      std::string result_buf;
+      std::string result_buf = op->var_->name_;  // use for var_name to mlir name mapping for non-tile op
       std::shared_ptr<const TileType> result_tile_type;
       if (auto tile_type = As<TileType>(op->var_->GetType())) {
         if (tile_type->memref_.has_value()) {
@@ -496,6 +559,10 @@ std::string PTOCodegen::GetVarName(const VarPtr& var) {
 
 std::string PTOCodegen::NewTemp() { return "%" + std::to_string(temp_counter_++); }
 
+void PTOCodegen::RegisterVarToMlir(const std::string& var_name, const std::string& mlir_name) {
+  var_to_mlir_[var_name] = mlir_name;
+}
+
 int64_t PTOCodegen::GetConstIntValue(const ExprPtr& expr) {
   if (auto const_int = As<ir::ConstInt>(expr)) {
     return const_int->value_;
@@ -561,11 +628,13 @@ static const char* TileLayoutToStr(ir::TileLayout layout) {
 // Helper to format tile_buf type string from components
 static std::string FormatTileBufTypeString(const std::string& loc, const std::string& dtype_str, int64_t rows,
                                            int64_t cols, ir::TileLayout blayout, ir::TileLayout slayout,
-                                           uint64_t fractal, ir::TilePad pad) {
+                                           uint64_t fractal, ir::TilePad pad, bool v_row_dynamic = false,
+                                           bool v_col_dynamic = false) {
   std::ostringstream oss;
   oss << "!pto.tile_buf<loc=" << loc << ", dtype=" << dtype_str;
   oss << ", rows=" << rows << ", cols=" << cols;
-  oss << ", v_row=" << rows << ", v_col=" << cols;
+  oss << ", v_row=" << (v_row_dynamic ? "?" : std::to_string(rows));
+  oss << ", v_col=" << (v_col_dynamic ? "?" : std::to_string(cols));
   oss << ", blayout=" << TileLayoutToStr(blayout);
   oss << ", slayout=" << TileLayoutToStr(slayout);
   oss << ", fractal=" << fractal;
@@ -576,7 +645,8 @@ static std::string FormatTileBufTypeString(const std::string& loc, const std::st
 // Extract dtype, shape and layout from a TileType into output parameters
 static void ExtractTileTypeInfo(const TileType& tile_type, const PTOCodegen& codegen, std::string& dtype_str,
                                 int64_t& rows, int64_t& cols, ir::TileLayout& blayout,
-                                ir::TileLayout& slayout, uint64_t& fractal, ir::TilePad& pad) {
+                                ir::TileLayout& slayout, uint64_t& fractal, ir::TilePad& pad,
+                                bool& v_row_dynamic, bool& v_col_dynamic) {
   dtype_str = codegen.GetTypeString(tile_type.dtype_);
   if (tile_type.shape_.size() >= 2) {
     if (auto c0 = As<ir::ConstInt>(tile_type.shape_[0])) rows = c0->value_;
@@ -593,6 +663,12 @@ static void ExtractTileTypeInfo(const TileType& tile_type, const PTOCodegen& cod
     slayout = tv.slayout;
     fractal = tv.fractal;
     pad = tv.pad;
+    if (tv.valid_shape.size() >= 1 && As<ir::Var>(tv.valid_shape[0])) {
+      v_row_dynamic = true;
+    }
+    if (tv.valid_shape.size() >= 2 && As<ir::Var>(tv.valid_shape[1])) {
+      v_col_dynamic = true;
+    }
   } else if (cols == 1 && rows > 1) {
     // Infer blayout from shape: column vectors [N, 1] use col_major (DN format convention)
     blayout = ir::TileLayout::col_major;
@@ -609,12 +685,16 @@ std::string PTOCodegen::GetTileBufTypeString(const ir::MemRef* memref) const {
   uint64_t fractal = 512;
   ir::TilePad pad = ir::TilePad::null;
 
+  bool v_row_dynamic = false;
+  bool v_col_dynamic = false;
   auto tile_it = memref_to_tile_type_.find(memref);
   if (tile_it != memref_to_tile_type_.end()) {
-    ExtractTileTypeInfo(*tile_it->second, *this, dtype_str, rows, cols, blayout, slayout, fractal, pad);
+    ExtractTileTypeInfo(*tile_it->second, *this, dtype_str, rows, cols, blayout, slayout, fractal, pad,
+                        v_row_dynamic, v_col_dynamic);
   }
 
-  return FormatTileBufTypeString(loc, dtype_str, rows, cols, blayout, slayout, fractal, pad);
+  return FormatTileBufTypeString(loc, dtype_str, rows, cols, blayout, slayout, fractal, pad, v_row_dynamic,
+                                 v_col_dynamic);
 }
 
 std::string PTOCodegen::GetTileBufTypeStringFromTileType(
@@ -630,10 +710,14 @@ std::string PTOCodegen::GetTileBufTypeStringFromTileType(
   ir::TileLayout slayout = ir::TileLayout::none_box;
   uint64_t fractal = 512;
   ir::TilePad pad = ir::TilePad::null;
+  bool v_row_dynamic = false;
+  bool v_col_dynamic = false;
 
-  ExtractTileTypeInfo(*tile_type, *this, dtype_str, rows, cols, blayout, slayout, fractal, pad);
+  ExtractTileTypeInfo(*tile_type, *this, dtype_str, rows, cols, blayout, slayout, fractal, pad, v_row_dynamic,
+                      v_col_dynamic);
 
-  return FormatTileBufTypeString(loc, dtype_str, rows, cols, blayout, slayout, fractal, pad);
+  return FormatTileBufTypeString(loc, dtype_str, rows, cols, blayout, slayout, fractal, pad, v_row_dynamic,
+                                 v_col_dynamic);
 }
 
 std::string PTOCodegen::GetExprTypeAnnotation(const ir::ExprPtr& expr) {

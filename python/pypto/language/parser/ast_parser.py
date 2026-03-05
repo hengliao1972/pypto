@@ -1227,7 +1227,7 @@ class ASTParser:
         if isinstance(value, bool):
             return ir.ConstBool(value, span)
         elif isinstance(value, int):
-            return ir.ConstInt(value, DataType.DEFAULT_CONST_INT, span)
+            return ir.ConstInt(value, DataType.INDEX, span)
         elif isinstance(value, float):
             return ir.ConstFloat(value, DataType.DEFAULT_CONST_FLOAT, span)
         else:
@@ -1679,6 +1679,13 @@ class ASTParser:
 
     def _resolve_list_kwarg(self, value: ast.List) -> Any:
         """Resolve a List kwarg value, trying closure eval first."""
+        # If any element refers to a name in IR scope, parse as IR expressions
+        # (mirrors _resolve_name_kwarg: IR scope takes priority over closure)
+        if any(
+            isinstance(elt, ast.Name) and self.scope_manager.lookup_var(elt.id) is not None
+            for elt in value.elts
+        ):
+            return self.parse_list(value)
         success, result = self.expr_evaluator.try_eval_expr(value)
         if success and isinstance(result, list):
             return result
