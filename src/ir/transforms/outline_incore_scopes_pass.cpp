@@ -68,7 +68,10 @@ class VarRefCollector : public IRVisitor {
  protected:
   void VisitExpr_(const VarPtr& op) override { var_refs.insert(op->name_); }
 
-  void VisitExpr_(const IterArgPtr& op) override { var_refs.insert(op->name_); }
+  void VisitExpr_(const IterArgPtr& op) override {
+    var_refs.insert(op->name_);
+    IRVisitor::VisitExpr_(op);
+  }
 };
 
 /**
