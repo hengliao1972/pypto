@@ -1541,9 +1541,14 @@ Pass ExpandMixedKernel() {
       new_functions.push_back(aiv_func);
       expanded_map[func->name_] = {aic_name, aiv_name};
 
-      // Step 4/10: Create InCoreFunctionGroup
+      // Step 4/10: Create InCoreFunctionGroup with explicit parameter mapping
       std::string group_name = func->name_ + "_group";
-      auto group = std::make_shared<InCoreFunctionGroup>(group_name, aic_name, aiv_name);
+      std::vector<std::string> shared_params;
+      for (const auto& p : func->params_) shared_params.push_back(p->name_);
+      std::vector<std::string> aiv_implicit_params = {"AIV_IDX"};
+      auto group = std::make_shared<InCoreFunctionGroup>(
+          group_name, aic_name, aiv_name,
+          std::move(shared_params), std::move(aiv_implicit_params));
       groups.push_back(group);
       func_to_group_map[func->name_] = group_name;
     }

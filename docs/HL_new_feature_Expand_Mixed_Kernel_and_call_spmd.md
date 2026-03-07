@@ -124,11 +124,44 @@ class InCoreFunctionGroup : public IRNode {
     Function* aic_kernel;          // the AIC (Cube) kernel function
     Function* aiv_kernel;          // the AIV (Vector) kernel function (parameterized by AIV_IDX)
 
+    // Parameter passing convention:
+    //   call_group(group, shared_params...)
+    //     → aic_kernel(shared_params...)
+    //     → aiv_kernel(shared_params..., AIV_IDX=0)   // runtime injects AIV_IDX
+    //     → aiv_kernel(shared_params..., AIV_IDX=1)   // runtime injects AIV_IDX
+    vector<string> shared_params;       // params passed from call_group to both kernels
+    vector<string> aiv_implicit_params; // params injected by runtime for AIV only (e.g., "AIV_IDX")
+
     uint8_t   dir_mask;            // DIR_C2V, DIR_V2C, or both
     uint32_t  slot_size;           // tile size for ring buffer slots
     // ... additional group-level metadata
 };
 ```
+
+#### Parameter Passing Convention
+
+When the orchestration function invokes `call_group`, the arguments are distributed to the AIC and AIV kernels as follows:
+
+1. **Shared parameters** (`shared_params`): All arguments provided in `call_group(group, arg0, arg1, ...)` are passed **positionally** to both the AIC kernel and the AIV kernel. Both kernels share the same parameter list (inherited from the original mixed kernel).
+
+2. **AIV implicit parameters** (`aiv_implicit_params`): The AIV kernel has additional parameters that are **not** supplied by `call_group`. These are injected by the runtime/code emitter when launching the AIV kernel. Currently, the only implicit parameter is `AIV_IDX` (the vector core index: 0 or 1).
+
+```
+// Orchestration:
+result = call_group(mixed_kernel_group, b_idx, query, key_cache, out)
+
+// Code emitter expands to:
+submit_task(mixed_kernel_aic,  {b_idx, query, key_cache, out})        // AIC
+submit_task(mixed_kernel_aiv,  {b_idx, query, key_cache, out, 0})     // AIV core 0
+submit_task(mixed_kernel_aiv,  {b_idx, query, key_cache, out, 1})     // AIV core 1
+//                                                            ↑
+//                                              AIV_IDX injected by runtime
+```
+
+This convention is recorded in the `InCoreFunctionGroup` IR node so that:
+- The IR dump is self-documenting (no hidden assumptions)
+- Downstream passes and codegen can query the mapping programmatically
+- Future extensions (e.g., multiple implicit params) are straightforward
 
 The `InCoreFunctionGroup` sits at the same level as `Function` in the IR module hierarchy:
 

@@ -202,22 +202,40 @@ using FunctionPtr = std::shared_ptr<const Function>;
  *
  * The orchestration function uses `call_group` to invoke the group, which
  * the code emitter expands into 1 AIC + 2 AIV kernel task submissions.
+ *
+ * Parameter passing convention:
+ *   call_group(group, shared_arg0, shared_arg1, ...)
+ *     → AIC kernel receives:  shared_arg0, shared_arg1, ...
+ *     → AIV kernel receives:  shared_arg0, shared_arg1, ..., AIV_IDX=0
+ *     → AIV kernel receives:  shared_arg0, shared_arg1, ..., AIV_IDX=1
+ *
+ * shared_params_ lists the parameter names passed from call_group to both
+ * kernels. aiv_implicit_params_ lists parameters injected by the runtime
+ * (not provided by call_group).
  */
 class InCoreFunctionGroup {
  public:
-  /**
-   * @brief Create an InCore function group
-   *
-   * @param name Group name (e.g., "mixed_kernel_incore_0_group")
-   * @param aic_name Name of the AIC kernel function
-   * @param aiv_name Name of the AIV kernel function
-   */
   InCoreFunctionGroup(std::string name, std::string aic_name, std::string aiv_name)
       : name_(std::move(name)), aic_name_(std::move(aic_name)), aiv_name_(std::move(aiv_name)) {}
 
-  std::string name_;      ///< Group name
-  std::string aic_name_;  ///< AIC kernel function name
-  std::string aiv_name_;  ///< AIV kernel function name
+  InCoreFunctionGroup(std::string name, std::string aic_name, std::string aiv_name,
+                      std::vector<std::string> shared_params,
+                      std::vector<std::string> aiv_implicit_params)
+      : name_(std::move(name)),
+        aic_name_(std::move(aic_name)),
+        aiv_name_(std::move(aiv_name)),
+        shared_params_(std::move(shared_params)),
+        aiv_implicit_params_(std::move(aiv_implicit_params)) {}
+
+  std::string name_;
+  std::string aic_name_;
+  std::string aiv_name_;
+
+  /// Parameter names passed from call_group to both AIC and AIV kernels
+  std::vector<std::string> shared_params_;
+
+  /// Parameter names injected by the runtime for AIV only (e.g., "AIV_IDX")
+  std::vector<std::string> aiv_implicit_params_;
 };
 
 using InCoreFunctionGroupPtr = std::shared_ptr<const InCoreFunctionGroup>;

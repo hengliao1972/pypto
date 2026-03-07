@@ -1155,11 +1155,40 @@ void IRPythonPrinter::VisitProgram(const ProgramPtr& program) {
     for (const auto& group : program->groups_) {
       if (group->aiv_name_ == func->name_) {
         stream_ << "\n";
-        // Print function group declaration
         stream_ << GetIndent() << "@" << prefix_ << ".function_group(aic=\""
-                << group->aic_name_ << "\", aiv=\"" << group->aiv_name_ << "\")\n";
+                << group->aic_name_ << "\", aiv=\"" << group->aiv_name_ << "\"";
+        if (!group->aiv_implicit_params_.empty()) {
+          stream_ << ", aiv_runtime_params=[";
+          for (size_t i = 0; i < group->aiv_implicit_params_.size(); ++i) {
+            if (i > 0) stream_ << ", ";
+            stream_ << "\"" << group->aiv_implicit_params_[i] << "\"";
+          }
+          stream_ << "]";
+        }
+        stream_ << ")\n";
         stream_ << GetIndent() << "class " << group->name_ << ":\n";
         IncreaseIndent();
+        // Print parameter mapping as docstring
+        stream_ << GetIndent() << "\"\"\"Parameter passing:\n";
+        stream_ << GetIndent() << "  call_group(" << group->name_;
+        for (const auto& p : group->shared_params_) stream_ << ", " << p;
+        stream_ << ")\n";
+        stream_ << GetIndent() << "    → " << group->aic_name_ << "(";
+        for (size_t i = 0; i < group->shared_params_.size(); ++i) {
+          if (i > 0) stream_ << ", ";
+          stream_ << group->shared_params_[i];
+        }
+        stream_ << ")\n";
+        stream_ << GetIndent() << "    → " << group->aiv_name_ << "(";
+        for (size_t i = 0; i < group->shared_params_.size(); ++i) {
+          if (i > 0) stream_ << ", ";
+          stream_ << group->shared_params_[i];
+        }
+        for (const auto& ip : group->aiv_implicit_params_) {
+          stream_ << ", " << ip << "=<runtime>";
+        }
+        stream_ << ")\n";
+        stream_ << GetIndent() << "\"\"\"\n";
         stream_ << GetIndent() << "pass\n";
         DecreaseIndent();
       }
