@@ -49,10 +49,12 @@ inline bool IsAICOperation(const std::string& op_name) {
 
 inline bool IsAIVOperation(const std::string& op_name) {
   static const std::unordered_set<std::string> aiv_ops = {
-      "tensor.view",    "tensor.read",    "tensor.create",  "tensor.assemble",
-      "tensor.mul",     "tensor.sub",     "tensor.div",     "tensor.add",
-      "tensor.exp",     "tensor.row_max", "tensor.row_sum", "tensor.cast",
-      "tensor.reshape", "tensor.maximum", "tensor.minimum",
+      "tensor.view",         "tensor.read",         "tensor.create",
+      "tensor.assemble",     "tensor.mul",          "tensor.sub",
+      "tensor.div",          "tensor.add",          "tensor.exp",
+      "tensor.row_max",      "tensor.row_sum",      "tensor.cast",
+      "tensor.reshape",      "tensor.maximum",      "tensor.minimum",
+      "tensor.deep_reshape", "tensor.deep_view",
   };
   return aiv_ops.count(op_name) > 0;
 }
@@ -617,7 +619,61 @@ FunctionPtr RunDCE(FunctionPtr func) {
 }
 
 // ============================================================================
-// Step 9: AIV Dual-Core Split — Whole-Chain Analysis ("Duplicated by Default")
+// Step 9b: Introduce Deep Copy Operations to Break Dependency Chains
+// ============================================================================
+//
+// Replace shallow (zero-copy) reshape/view with deep (copy-semantic) equivalents
+// in the AIV kernel.  This breaks large dependency chains at reshape/view
+// boundaries so that each sub-chain can be independently analyzed for splitting.
+//
+// Rules:
+//   tensor.reshape           → tensor.deep_reshape     (always)
+//   tensor.view(local_src, …) → tensor.deep_view       (only if src is NOT a func param)
+
+class ShallowToDeepMutator : public IRMutator {
+ public:
+  explicit ShallowToDeepMutator(const std::unordered_set<std::string>& func_param_names)
+      : func_param_names_(func_param_names) {}
+
+ protected:
+  StmtPtr VisitStmt_(const AssignStmtPtr& op) override {
+    auto call = As<Call>(op->value_);
+    if (!call) return IRMutator::VisitStmt_(op);
+    auto opnode = std::dynamic_pointer_cast<const Op>(call->op_);
+    if (!opnode) return IRMutator::VisitStmt_(op);
+
+    auto tt = std::dynamic_pointer_cast<const TensorType>(op->var_->GetType());
+    if (!tt || tt->shape_.empty()) return IRMutator::VisitStmt_(op);
+
+    if (opnode->name_ == "tensor.reshape") {
+      auto deep_op = std::make_shared<Op>("tensor.deep_reshape");
+      auto new_call = std::make_shared<Call>(deep_op, call->args_, call->kwargs_,
+                                             call->GetType(), call->span_);
+      return std::make_shared<AssignStmt>(op->var_, new_call, op->span_);
+    }
+
+    if (opnode->name_ == "tensor.view") {
+      if (!call->args_.empty()) {
+        if (auto src_var = As<Var>(call->args_[0])) {
+          if (!func_param_names_.count(src_var->name_)) {
+            auto deep_op = std::make_shared<Op>("tensor.deep_view");
+            auto new_call = std::make_shared<Call>(deep_op, call->args_, call->kwargs_,
+                                                   call->GetType(), call->span_);
+            return std::make_shared<AssignStmt>(op->var_, new_call, op->span_);
+          }
+        }
+      }
+    }
+
+    return IRMutator::VisitStmt_(op);
+  }
+
+ private:
+  const std::unordered_set<std::string>& func_param_names_;
+};
+
+// ============================================================================
+// Step 9c: AIV Dual-Core Split — Whole-Chain Analysis ("Duplicated by Default")
 // ============================================================================
 
 inline std::optional<int64_t> TryGetConstInt(const ExprPtr& expr) {
@@ -654,10 +710,29 @@ class ChainSplitAnalyzer : public IRVisitor {
     BuildChains();
     AnalyzeChains();
 
-    if (!duplicated_vars.empty()) {
-      LOG_INFO << "ExpandMixedKernel: duplicated vars (whole-chain analysis): ";
-      for (const auto& v : duplicated_vars) LOG_INFO << "  " << v;
+    // Log chain analysis results
+    size_t split_count = 0, dup_count = 0;
+    std::unordered_map<std::string, std::vector<std::string>> chain_groups_log;
+    for (const auto& [var_name, info] : var_info_) {
+      if (!info.tensor_type) continue;
+      chain_groups_log[Find(var_name)].push_back(var_name);
     }
+    for (const auto& [rep, vars] : chain_groups_log) {
+      bool is_split = var_split_info.count(vars[0]) > 0;
+      if (is_split) {
+        auto& si = var_split_info.at(vars[0]);
+        LOG_INFO << "ExpandMixedKernel: chain [SPLIT axis=" << si.split_axis
+                 << " dim=" << si.original_dim << "→" << si.half_dim
+                 << "] (" << vars.size() << " vars)";
+        split_count += vars.size();
+      } else {
+        LOG_INFO << "ExpandMixedKernel: chain [DUPLICATED] (" << vars.size() << " vars):";
+        for (const auto& v : vars) LOG_INFO << "    " << v;
+        dup_count += vars.size();
+      }
+    }
+    LOG_INFO << "ExpandMixedKernel: total chains=" << chain_groups_log.size()
+             << "  split_vars=" << split_count << "  duplicated_vars=" << dup_count;
   }
 
  protected:
@@ -728,9 +803,15 @@ class ChainSplitAnalyzer : public IRVisitor {
   // Phase 1: Group tensor vars into chains via union-find.
   // Two tensor vars are in the same chain if connected through producer-consumer
   // edges of local (non-parameter) tensor operations.
+  //
+  // Deep copy operations (tensor.deep_reshape, tensor.deep_view) act as chain
+  // boundaries: their output starts a new chain independent of the input.
+  // This breaks mega-chains into sub-chains that may each have a valid common
+  // split axis, even when the reshaped intermediate dimensions differ.
   void BuildChains() {
     for (const auto& [var_name, info] : var_info_) {
       if (!info.tensor_type) continue;
+      if (info.op_name == "tensor.deep_reshape" || info.op_name == "tensor.deep_view") continue;
       for (const auto& input_name : info.input_vars) {
         if (func_param_names_ && func_param_names_->count(input_name)) continue;
         auto it = var_info_.find(input_name);
@@ -835,11 +916,17 @@ class AIVSplitMutator : public IRMutator {
     if (opnode->name_ == "tensor.view") {
       return RewriteTensorView(op, call, split_info);
     }
+    if (opnode->name_ == "tensor.deep_view") {
+      return RewriteTensorView(op, call, split_info);
+    }
     if (opnode->name_ == "tensor.create") {
       return RewriteTensorCreate(op, call, split_info);
     }
     if (opnode->name_ == "tensor.assemble") {
       return RewriteTensorAssemble(op, call, split_info);
+    }
+    if (opnode->name_ == "tensor.deep_reshape") {
+      return RewriteTensorReshape(op, call, split_info);
     }
     if (opnode->name_.find("comm.tpop_from_aic") != std::string::npos) {
       return RewriteTpopFromAic(op, split_info);
@@ -1065,6 +1152,27 @@ class AIVSplitMutator : public IRMutator {
     new_call_args[2] = new_offset;
     auto new_call = std::make_shared<Call>(call->op_, new_call_args, call->kwargs_, call->GetType(), op->span_);
     return std::make_shared<AssignStmt>(op->var_, new_call, op->span_);
+  }
+
+  StmtPtr RewriteTensorReshape(const AssignStmtPtr& op, const CallPtr& call,
+                               const TensorSplitInfo& info) {
+    if (call->args_.size() < 2) return IRMutator::VisitStmt_(op);
+    auto shape_elems = ExtractTupleElements(call->args_[1]);
+    if (!shape_elems || static_cast<int>(shape_elems->elements.size()) <= info.split_axis)
+      return IRMutator::VisitStmt_(op);
+
+    auto new_shape_elems = shape_elems->elements;
+    new_shape_elems[info.split_axis] = MakeHalfDim(info.half_dim, op->span_);
+    auto new_shape = RebuildTuple(*shape_elems, new_shape_elems, op->span_);
+
+    auto new_call_args = call->args_;
+    new_call_args[1] = new_shape;
+    auto new_type = MakeHalfType(
+        *std::dynamic_pointer_cast<const TensorType>(op->var_->GetType()), info, op->span_);
+    auto new_var = std::make_shared<Var>(op->var_->name_, new_type, op->var_->span_);
+    auto new_call = std::make_shared<Call>(call->op_, new_call_args, call->kwargs_, new_type, op->span_);
+    var_half_dim_[op->var_->name_] = info.half_dim;
+    return std::make_shared<AssignStmt>(new_var, new_call, op->span_);
   }
 
   static bool IsElementWiseOrReduction(const std::string& name) {
@@ -1402,10 +1510,17 @@ Pass ExpandMixedKernel() {
           func->span_, FunctionType::InCore);
       aiv_func = RunDCE(aiv_func);
 
-      // Step 9b-c: whole-chain analysis and split tensors in AIV kernel
+      // Step 9b: introduce deep copies to break dependency chains
       std::unordered_set<std::string> func_param_names;
       for (const auto& p : func->params_) func_param_names.insert(p->name_);
 
+      ShallowToDeepMutator shallow_to_deep(func_param_names);
+      auto deep_body = shallow_to_deep.VisitStmt(aiv_func->body_);
+      aiv_func = std::make_shared<Function>(
+          aiv_func->name_, aiv_func->params_, aiv_func->param_directions_,
+          aiv_func->return_types_, deep_body, aiv_func->span_, aiv_func->func_type_);
+
+      // Step 9c: whole-chain analysis and split tensors in AIV kernel
       ChainSplitAnalyzer chain_analyzer;
       chain_analyzer.Analyze(aiv_func->body_, func_param_names);
 

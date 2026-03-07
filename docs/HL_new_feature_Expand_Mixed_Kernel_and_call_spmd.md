@@ -323,7 +323,76 @@ def F_aiv(self, ...) -> ...:
 def F_aiv(self, ..., AIV_IDX: uint8_t) -> ...:
 ```
 
-**9b. Split tensor variables by `AIV_IDX`:**
+**9b. Introduce Deep Copy Operations (`deep_reshape`, `deep_view`) to Break Dependency Chains:**
+
+Before running the whole-chain splittability analysis, the pass strategically replaces certain shallow (zero-copy) operations with their **deep** (copy-semantic) equivalents. This is a key optimization that breaks overly-large dependency chains into smaller, independently-analyzable sub-chains — dramatically improving the chance of finding splittable operations.
+
+**Motivation — Why shallow operations create unsplittable mega-chains:**
+
+Consider the online softmax rescaling pattern in PagedAttention:
+
+```
+mi_0:        [16, 1]   ← row_max result
+mi_prev_nd:  [1, 16]   ← reshape(mi_update, [1, 16])   // shape transposition!
+alpha_0:     [1, 16]   ← exp(sub(mi_prev_nd, mi_new))
+alpha_dn:    [16, 1]   ← reshape(alpha_0, [16, 1])      // shape transposition back
+oi_scaled:   [16, 128] ← mul(oi_iter, alpha_dn)
+```
+
+With shallow `tensor.reshape`, the dependency chain analysis sees `mi_0 → mi_prev_nd → ... → alpha_0 → alpha_dn → oi_scaled` as one connected chain. The `[16, X]` tensors and the `[1, 16]` tensors are in the **same** chain. No single split axis works for all:
+- Axis 0: `[1, 16]` tensors have dim=1, cannot halve → **fails**
+- Axis 1: Forbidden by `row_max`/`row_sum` → **fails**
+
+Result: The entire chain (including many perfectly splittable `[16, X]` operations) is forced to `DUPLICATED`.
+
+**Solution — Deep copy operations as chain boundaries:**
+
+Two new IR operations with **copy semantics** (the output is a new, independent allocation):
+
+| Operation | Shallow equivalent | Semantics |
+|---|---|---|
+| `tensor.deep_reshape(input, shape)` | `tensor.reshape(input, shape)` | Allocate new tensor, copy data from `input`, reinterpret as `shape` |
+| `tensor.deep_view(src, shape, offset)` | `tensor.view(src, shape, offset)` | Allocate new tensor, copy the viewed region from `src` |
+
+Because the output is an **independent allocation**, there is no data-sharing dependency between the input and output — the chain analysis naturally treats them as separate chains.
+
+**Replacement rules:**
+
+```
+function introduce_deep_copies(F_aiv, func_param_names):
+    for each operation OP in F_aiv:
+        if OP is "tensor.reshape":
+            replace OP with "tensor.deep_reshape"    // always replace
+        if OP is "tensor.view" and source is NOT a function parameter:
+            replace OP with "tensor.deep_view"       // local-to-local views only
+    // Note: views from function parameters (global memory) are kept shallow
+    // because they need AIV_IDX-based offset computation for splitting.
+```
+
+**Effect on the example above:**
+
+After replacing `reshape` → `deep_reshape`:
+
+```
+// Chain A (softmax, all [16, X]):
+mi_0 = row_max(scaled_0)          // [16, 1]   → split axis 0: [8, 1]
+// ... mi_0's chain ends here (deep_reshape breaks it)
+
+// Chain B (rescaling, all [1, 16]):
+mi_prev_nd = deep_reshape(mi_update, [1, 16])  // NEW chain start
+alpha_0 = exp(...)                              // [1, 16]   → split axis 1: [1, 8]
+// ... alpha_0's chain ends here (deep_reshape breaks it)
+
+// Chain C (final update, all [16, X]):
+alpha_dn = deep_reshape(alpha_0, [16, 1])       // NEW chain start
+oi_scaled = mul(oi_iter, alpha_dn)              // [16, 128] → split axis 0: [8, 128]
+```
+
+Three independent chains, each with a valid common split axis! Element counts across reshape boundaries remain consistent:
+- `mi_0 [8, 1]` (8 elements) → `deep_reshape` → `mi_prev_nd [1, 8]` (8 elements) ✓
+- `alpha_0 [1, 8]` (8 elements) → `deep_reshape` → `alpha_dn [8, 1]` (8 elements) ✓
+
+**9c. Split tensor variables by `AIV_IDX`:**
 
 For each tensor variable `T` in the AIV kernel, replace it with a **half-sized** tensor `T_half` addressed by `AIV_IDX`. The split decision is governed by two principles in strict priority order:
 
@@ -768,8 +837,17 @@ ExpandMixedKernel(program):
 
         // Step 9: AIV dual-core split (duplicated-by-default, whole-chain analysis)
         add AIV_IDX argument to F_aiv
+
+        // Step 9b: Introduce deep copies to break dependency chains
+        for each "tensor.reshape" in F_aiv:
+            replace with "tensor.deep_reshape"
+        for each "tensor.view" in F_aiv where source is NOT a function parameter:
+            replace with "tensor.deep_view"
+
+        // Step 9c: Whole-chain analysis
         initialize ALL operations in F_aiv as DUPLICATED
         chains = extract_dependency_chains(F_aiv)
+        // Note: deep_reshape/deep_view outputs start new chains
         for each chain C in chains:
             forbidden = union of local_forbidden_axes(OP) for OP in C
             axis = find_common_split_axis(C, forbidden)
