@@ -20,13 +20,19 @@ from ..utils import _get_span_or_capture, _normalize_expr, _to_make_tuple
 
 
 def create(
-    shape: Sequence[int | Expr] | _ir_core.MakeTuple, dtype: DataType, span: Span | None = None
+    shape: Sequence[int | Expr] | _ir_core.MakeTuple,
+    dtype: DataType,
+    valid_shape: Sequence[int | Expr] | _ir_core.MakeTuple | None = None,
+    span: Span | None = None,
 ) -> Call:
     """Create a new tensor with specified shape and dtype.
 
     Args:
         shape: List of dimension sizes (int or Expr), or a MakeTuple
         dtype: Data type of tensor elements
+        valid_shape: Logical data extent. When provided, valid_shape[i] <= shape[i]
+            for every axis. Defaults to shape (fully valid).
+            NOTE: accepted by the API but not yet propagated to the IR backend.
         span: Optional source span for debugging (auto-captured if not provided)
 
     Returns:
@@ -82,6 +88,7 @@ def view(
     tensor: Expr,
     shape: list[int | Expr] | _ir_core.MakeTuple,
     offset: list[int | Expr] | _ir_core.MakeTuple,
+    valid_shape: list[int | Expr] | _ir_core.MakeTuple | None = None,
     span: Span | None = None,
 ) -> Call:
     """Create a view/slice of a tensor with new shape and offset.
@@ -90,6 +97,12 @@ def view(
         tensor: Input tensor expression
         shape: New shape dimensions, or a MakeTuple
         offset: Offset dimensions for the view, or a MakeTuple
+        valid_shape: Logical data extent within the view. When provided,
+            valid_shape[i] <= shape[i] for every axis. Defaults to shape
+            (fully valid). See tensor_valid_shape.md for details.
+            NOTE: accepted by the API but not yet propagated to the IR backend.
+            Once the C++ tensor.view op supports a 4th valid_shapes argument,
+            this will be forwarded automatically.
         span: Optional source span for debugging (auto-captured if not provided)
 
     Returns:

@@ -59,17 +59,24 @@ def _normalize_intlike(seq: Sequence[IntLike]) -> list[int | Expr]:
     return [elem.unwrap() if isinstance(elem, Scalar) else elem for elem in seq]
 
 
-def create_tensor(shape: Sequence[IntLike], dtype: DataType) -> Tensor:
+def create_tensor(
+    shape: Sequence[IntLike],
+    dtype: DataType,
+    valid_shape: Sequence[IntLike] | None = None,
+) -> Tensor:
     """Create a new tensor with specified shape and dtype.
 
     Args:
         shape: List of dimension sizes (int or Expr)
         dtype: Data type of tensor elements
+        valid_shape: Logical data extent. valid_shape[i] <= shape[i] for every
+            axis. Defaults to shape (fully valid).
 
     Returns:
         Tensor wrapping the create operation
     """
-    call_expr = _ir_ops.create(_normalize_intlike(shape), dtype)
+    vs = _normalize_intlike(valid_shape) if valid_shape is not None else None
+    call_expr = _ir_ops.create(_normalize_intlike(shape), dtype, valid_shape=vs)
     return Tensor(expr=call_expr)
 
 
@@ -103,19 +110,29 @@ def dim(tensor: Tensor, axis: int) -> Scalar:
     return Scalar(expr=call_expr)
 
 
-def view(tensor: Tensor, shape: Sequence[IntLike], offset: Sequence[IntLike]) -> Tensor:
+def view(
+    tensor: Tensor,
+    shape: Sequence[IntLike],
+    offset: Sequence[IntLike],
+    valid_shape: Sequence[IntLike] | None = None,
+) -> Tensor:
     """Create a view/slice of a tensor with new shape and offset.
 
     Args:
         tensor: Input tensor
         shape: New shape dimensions
         offset: Offset dimensions for the view
+        valid_shape: Logical data extent within the view. valid_shape[i] <= shape[i]
+            for every axis. Defaults to shape (fully valid).
 
     Returns:
         Tensor wrapping the view operation
     """
     tensor_expr = tensor.unwrap()
-    call_expr = _ir_ops.view(tensor_expr, _normalize_intlike(shape), _normalize_intlike(offset))
+    vs = _normalize_intlike(valid_shape) if valid_shape is not None else None
+    call_expr = _ir_ops.view(
+        tensor_expr, _normalize_intlike(shape), _normalize_intlike(offset), valid_shape=vs
+    )
     return Tensor(expr=call_expr)
 
 
