@@ -535,6 +535,10 @@ inline ExprPtr MakeBitNot(const ExprPtr& operand, const Span& span = Span::unkno
   return std::make_shared<BitNot>(operand, dtype, span);
 }
 
+inline ExprPtr MakeNot(const ExprPtr& operand, const Span& span = Span::unknown()) {
+  return std::make_shared<Not>(operand, DataType::BOOL, span);
+}
+
 }  // namespace ir
 }  // namespace pypto
 
