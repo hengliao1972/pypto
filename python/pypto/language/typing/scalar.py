@@ -9,10 +9,27 @@
 
 """Scalar wrapper type for PyPTO Language DSL."""
 
-from typing import Any
+from typing import Any, cast
 
 from pypto.pypto_core import DataType
 from pypto.pypto_core.ir import Expr
+
+
+def _validate_scalar_meta_call(args: tuple[Any, ...], kwargs: dict[str, Any]) -> None:
+    """Validate ScalarMeta.__call__ argument structure."""
+    allowed_kwargs = {"dtype", "expr", "_annotation_only"}
+    unexpected = set(kwargs) - allowed_kwargs
+    if unexpected:
+        name = sorted(unexpected)[0]
+        raise TypeError(f"Scalar() got an unexpected keyword argument '{name}'")
+
+    if len(args) > 3:
+        raise TypeError(f"Scalar() takes at most 3 positional arguments but {len(args)} were given")
+
+    param_names = ("dtype", "expr", "_annotation_only")
+    for index, name in enumerate(param_names[: len(args)]):
+        if name in kwargs:
+            raise TypeError(f"Scalar() got multiple values for argument '{name}'")
 
 
 class ScalarMeta(type):
@@ -29,9 +46,7 @@ class ScalarMeta(type):
         """
         return cls(dtype, _annotation_only=True)
 
-    def __call__(
-        cls, dtype: Any = None, expr: Expr | None = None, _annotation_only: bool = False
-    ) -> "Scalar":  # type: ignore[misc]
+    def __call__(cls, *args: Any, **kwargs: Any) -> "Scalar":
         """Enable both Scalar(dtype) syntax and runtime wrapping.
 
         Args:
@@ -42,10 +57,16 @@ class ScalarMeta(type):
         Returns:
             Scalar instance
         """
+        _validate_scalar_meta_call(args, kwargs)
+
         # When called with just dtype (legacy notation), treat it as annotation mode
-        if dtype is not None and expr is None and not _annotation_only:
-            _annotation_only = True
-        return type.__call__(cls, dtype, expr, _annotation_only)
+        dtype = kwargs.get("dtype", args[0] if len(args) > 0 else None)
+        expr = kwargs.get("expr", args[1] if len(args) > 1 else None)
+        annotation_only = kwargs.get("_annotation_only", args[2] if len(args) > 2 else False)
+
+        if dtype is not None and expr is None and not annotation_only:
+            annotation_only = True
+        return cast("Scalar", type.__call__(cls, dtype, expr, annotation_only))
 
 
 class Scalar(metaclass=ScalarMeta):

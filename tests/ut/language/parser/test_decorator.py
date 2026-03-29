@@ -260,6 +260,34 @@ class TestScalarParameters:
         # Runtime: legacy pl.Scalar(dtype) still creates valid annotation-only instance
         assert pl.Scalar(pl.FP32).dtype == pl.FP32
 
+    def test_scalar_legacy_call_rejects_duplicate_dtype(self):
+        """Scalar legacy call rejects duplicate dtype values."""
+        with pytest.raises(TypeError, match="multiple values for argument 'dtype'"):
+            pl.Scalar(pl.FP32, dtype=pl.INT32)
+
+    def test_scalar_legacy_call_rejects_unknown_kwarg(self):
+        """Scalar legacy call rejects unknown keyword arguments."""
+        with pytest.raises(TypeError, match="unexpected keyword argument 'typo'"):
+            pl.Scalar(dtype=pl.FP32, typo=1)
+
+    def test_tensor_call_rejects_unknown_kwarg(self):
+        """Tensor call rejects unknown keyword arguments."""
+        with pytest.raises(TypeError, match="unexpected keyword argument 'foo'"):
+            pl.Tensor([1], pl.FP32, foo=1)
+
+    def test_tensor_call_rejects_duplicate_shape(self):
+        """Tensor call rejects duplicate shape values."""
+        with pytest.raises(TypeError, match="multiple values for argument 'shape'"):
+            pl.Tensor([1], pl.FP32, shape=[2])
+
+    def test_tensor_legacy_call_notation(self):
+        """Legacy Tensor(shape, dtype) call still produces annotation-only instances."""
+        tensor = pl.Tensor((64, 128), pl.FP16)
+        assert tensor.dtype == pl.FP16
+        assert tensor.shape == (64, 128)
+        with pytest.raises(ValueError, match="annotation-only Tensor"):
+            tensor.unwrap()
+
     def test_tile_ops_with_scalar(self):
         """Test tile operations with scalar parameter."""
 
@@ -1611,7 +1639,7 @@ class TestExternalFunctionControlFlow:
         ) -> pl.Tensor[[64], pl.FP32]:
             init_a: pl.Tensor[[64], pl.FP32] = x
             init_b: pl.Tensor[[64], pl.FP32] = x
-            for i, (a, b) in pl.range(5, init_values=(init_a, init_b)):  # type: ignore
+            for i, (a, b) in pl.range(5, init_values=(init_a, init_b)):
                 new_a: pl.Tensor[[64], pl.FP32] = pl.add(a, 1.0)
                 new_b: pl.Tensor[[64], pl.FP32] = pl.mul(b, 2.0)
                 out_a, out_b = pl.yield_(new_a, new_b)
@@ -1631,7 +1659,7 @@ class TestExternalFunctionControlFlow:
             def dual_accumulate(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
                 init_a: pl.Tensor[[64], pl.FP32] = x
                 init_b: pl.Tensor[[64], pl.FP32] = x
-                for i, (a, b) in pl.range(5, init_values=(init_a, init_b)):  # type: ignore
+                for i, (a, b) in pl.range(5, init_values=(init_a, init_b)):
                     new_a: pl.Tensor[[64], pl.FP32] = pl.add(a, 1.0)
                     new_b: pl.Tensor[[64], pl.FP32] = pl.mul(b, 2.0)
                     out_a, out_b = pl.yield_(new_a, new_b)
@@ -1878,7 +1906,7 @@ class TestInlineFunctionControlFlow:
         ) -> pl.Tensor[[64], pl.FP32]:
             init_a: pl.Tensor[[64], pl.FP32] = x
             init_b: pl.Tensor[[64], pl.FP32] = x
-            for i, (a, b) in pl.range(5, init_values=(init_a, init_b)):  # type: ignore
+            for i, (a, b) in pl.range(5, init_values=(init_a, init_b)):
                 new_a: pl.Tensor[[64], pl.FP32] = pl.add(a, 1.0)
                 new_b: pl.Tensor[[64], pl.FP32] = pl.mul(b, 2.0)
                 out_a, out_b = pl.yield_(new_a, new_b)
@@ -1898,7 +1926,7 @@ class TestInlineFunctionControlFlow:
             def main(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
                 init_a: pl.Tensor[[64], pl.FP32] = x
                 init_b: pl.Tensor[[64], pl.FP32] = x
-                for i, (a, b) in pl.range(5, init_values=(init_a, init_b)):  # type: ignore
+                for i, (a, b) in pl.range(5, init_values=(init_a, init_b)):
                     new_a: pl.Tensor[[64], pl.FP32] = pl.add(a, 1.0)
                     new_b: pl.Tensor[[64], pl.FP32] = pl.mul(b, 2.0)
                     out_a, out_b = pl.yield_(new_a, new_b)
